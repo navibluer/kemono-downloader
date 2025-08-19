@@ -6,18 +6,20 @@ import aiofiles
 import os
 import re
 
+# ---------------- 配置 ----------------
 IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
-MAX_PAGE_CONCURRENCY = 3
-MAX_DOWNLOAD_CONCURRENCY = 20
-MAX_RETRY = 2
-MAX_PAGE_RETRY = 2
+MAX_PAGE_CONCURRENCY = 3  # 同時打開文章頁面數量
+MAX_DOWNLOAD_CONCURRENCY = 10  # 同時下載圖片數量
+MAX_RETRY = 2  # 失敗圖片重試次數
+MAX_PAGE_RETRY = 2  # 打開文章頁面重試次數
+BATCH_SIZE = 5  # 分批處理文章數量
 
 
+# ---------------- 工具函數 ----------------
 def is_image_url(url):
     return url.lower().endswith(IMG_EXTENSIONS)
 
 
-# ---------------- Spinner ----------------
 async def spinner(msg="Processing"):
     try:
         while True:
@@ -28,27 +30,30 @@ async def spinner(msg="Processing"):
         print("\r" + " " * (len(msg) + 2) + "\r", end="", flush=True)
 
 
-# ---------------- Download ----------------
 async def download_image(
     session,
     url,
+    save_dir,
     progress,
     sem,
     failed_images,
-    save_path_override,
+    save_path_override=None,
     stats=None,
     is_retry=False,
 ):
     async with sem:
         try:
-            save_path = save_path_override
+            save_path = save_path_override or os.path.join(
+                save_dir, url.split("/")[-1].split("?")[0]
+            )
+
             if os.path.exists(save_path):
                 progress["done"] += 1
-                print("\r", end="")
                 print(
-                    f"[{progress['done']}/{progress['total']}] SKIP {os.path.basename(save_path)}"
+                    f"\r[{progress['done']}/{progress['total']}] SKIP {os.path.basename(save_path)}",
+                    end="",
                 )
-                if stats is not None:
+                if stats:
                     stats["SKIP"] += 1
                 return True
 
@@ -57,43 +62,38 @@ async def download_image(
                     async with aiofiles.open(save_path, "wb") as f:
                         await f.write(await resp.read())
                     progress["done"] += 1
-                    print("\r", end="")
                     print(
-                        f"[{progress['done']}/{progress['total']}] OK {os.path.basename(save_path)}"
+                        f"\r[{progress['done']}/{progress['total']}] OK {os.path.basename(save_path)}",
+                        end="",
                     )
-                    if stats is not None:
-                        if is_retry:
-                            stats["OK_retry"] += 1
-                        else:
-                            stats["OK_first"] += 1
+                    if stats:
+                        stats["OK_retry" if is_retry else "OK_first"] += 1
                     return True
                 else:
                     progress["done"] += 1
-                    print("\r", end="")
-                    print(f"[{progress['done']}/{progress['total']}] FAIL {url}")
+                    print(
+                        f"\r[{progress['done']}/{progress['total']}] FAIL {url}", end=""
+                    )
                     failed_images.append(url)
-                    if is_retry and stats is not None:
+                    if is_retry and stats:
                         stats["FAIL_final"] += 1
                     return False
         except Exception as e:
             progress["done"] += 1
-            print("\r", end="")
-            print(f"[{progress['done']}/{progress['total']}] ERR {url} {e}")
+            print(f"\r[{progress['done']}/{progress['total']}] ERR {url} {e}", end="")
             failed_images.append(url)
-            if is_retry and stats is not None:
+            if is_retry and stats:
                 stats["ERR_final"] += 1
             return False
 
 
-# ---------------- Playwright ----------------
 async def get_article_links(page, base_url):
     elements = await page.query_selector_all("article a")
-    links = []
-    for a in elements:
-        href = await a.get_attribute("href")
-        if href:
-            links.append(urljoin(base_url, href))
-    return links
+    return [
+        urljoin(base_url, await a.get_attribute("href"))
+        for a in elements
+        if await a.get_attribute("href")
+    ]
 
 
 async def get_image_links(page, base_url):
@@ -108,6 +108,7 @@ async def get_image_links(page, base_url):
     return img_urls
 
 
+# ---------------- 處理文章頁 ----------------
 async def process_article_page(
     link,
     browser,
@@ -117,20 +118,28 @@ async def process_article_page(
     failed_images,
     stats,
     existing_titles,
-    url_to_path,
-    save_dir,
 ):
     for attempt in range(MAX_PAGE_RETRY + 1):
         page = await browser.new_page()
         try:
+            # 禁用非必要資源
+            await page.route(
+                "**/*",
+                lambda route: (
+                    route.abort()
+                    if route.request.resource_type in ["image", "stylesheet", "font"]
+                    else route.continue_()
+                ),
+            )
+
             try:
                 await page.goto(link, wait_until="domcontentloaded", timeout=20000)
-            except:
+            except Exception:
                 if attempt < MAX_PAGE_RETRY:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
                     continue
                 else:
-                    print(f"Failed to open {link} after retries")
+                    print(f"\nFailed to open {link} after retries")
                     return
 
             try:
@@ -141,19 +150,19 @@ async def process_article_page(
                 pass
 
             title_element = await page.query_selector("h1.post__title")
+            title = "untitled"
             if title_element:
-                title = await title_element.inner_text()
-                title = re.sub(r"[\\/:\*\?\"<>|]", "_", title)
-                if not title.strip():
+                title = re.sub(
+                    r"[\\/:\*\?\"<>|]", "_", (await title_element.inner_text()).strip()
+                )
+                if not title:
                     title = "untitled"
-            else:
-                title = "untitled"
 
             if title.startswith("untitled"):
                 uid = re.search(r"/post/(\d+)", link)
-                uid = uid.group(1) if uid else str(hash(link))
-                title = f"{title}_{uid}"
+                title = f"{title}_{uid.group(1) if uid else str(hash(link))}"
 
+            # 避免標題重複
             base_title = title
             suffix = 1
             while title in existing_titles:
@@ -167,30 +176,28 @@ async def process_article_page(
                     await asyncio.sleep(1)
                     continue
                 else:
-                    print(f"No figure found on {link}")
+                    print(f"\nNo figure found on {link}")
                     return
 
             img_urls = await get_image_links(page, link)
             progress["total"] += len(img_urls)
 
-            tasks = []
-            for idx, img in enumerate(img_urls, start=1):
-                ext = os.path.splitext(img)[1].split("?")[0] or ".jpg"
-                filename = f"{title}_{idx}{ext}"
-                save_path = os.path.join(save_dir, filename)
-                url_to_path[img] = save_path
-                tasks.append(
-                    download_image(
-                        session,
-                        img,
-                        progress,
-                        download_sem,
-                        failed_images,
-                        save_path_override=save_path,
-                        stats=stats,
-                        is_retry=False,
-                    )
+            tasks = [
+                download_image(
+                    session,
+                    img,
+                    "imgs",
+                    progress,
+                    download_sem,
+                    failed_images,
+                    save_path_override=os.path.join(
+                        "imgs",
+                        f"{title}_{idx}{os.path.splitext(img)[1].split('?')[0] or '.jpg'}",
+                    ),
+                    stats=stats,
                 )
+                for idx, img in enumerate(img_urls, start=1)
+            ]
             await asyncio.gather(*tasks)
             break
         finally:
@@ -200,36 +207,26 @@ async def process_article_page(
 # ---------------- Main ----------------
 async def main():
     base_url = input("URL? ")
+    os.makedirs("imgs", exist_ok=True)
 
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=60)
-
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
 
+            spinner_task = asyncio.create_task(spinner("Fetching pages..."))
+
             page = await browser.new_page()
             await page.goto(base_url)
             await page.wait_for_load_state("networkidle")
-
-            # 抓 span[itemprop="name"] 作資料夾名稱
-            folder_name = "imgs"
-            try:
-                span_elem = await page.query_selector('span[itemprop="name"]')
-                if span_elem:
-                    folder_name = os.path.join(
-                        "imgs", (await span_elem.inner_text()).strip()
-                    )
-            except:
-                folder_name = "imgs"
-            os.makedirs(folder_name, exist_ok=True)
-
             text = await page.inner_text("body")
             match = re.search(r"Showing\s+\d+\s*-\s*\d+\s+of\s+(\d+)", text)
             total_items = int(match.group(1)) if match else 0
             await page.close()
 
             print(f"Total articles found: {total_items}")
+
             page_urls = [base_url] + [
                 f"{base_url}?o={offset}" for offset in range(50, total_items, 50)
             ]
@@ -244,8 +241,7 @@ async def main():
                     try:
                         await page.goto(page_url)
                         await page.wait_for_selector("article", timeout=10000)
-                        links = await get_article_links(page, page_url)
-                        return links
+                        return await get_article_links(page, page_url)
                     finally:
                         await page.close()
 
@@ -253,6 +249,8 @@ async def main():
             for r in results:
                 article_links_all.extend(r)
 
+            spinner_task.cancel()
+            await asyncio.sleep(0.1)
             print(f"Total article links collected: {len(article_links_all)}")
 
             progress = {"done": 0, "total": 0}
@@ -265,52 +263,46 @@ async def main():
             }
             download_sem = asyncio.Semaphore(MAX_DOWNLOAD_CONCURRENCY)
             failed_images = []
-            url_to_path = {}
+            existing_titles = set()
 
-            for attempt in range(MAX_RETRY + 1):
-                spinner_task = asyncio.create_task(
-                    spinner(f"Downloading images (round {attempt+1})...")
-                )
-                current_failed = []
-
-                if attempt == 0:
-                    existing_titles = set()
-                    tasks = [
-                        process_article_page(
-                            link,
-                            browser,
-                            session,
-                            progress,
-                            download_sem,
-                            current_failed,
-                            stats,
-                            existing_titles,
-                            url_to_path,
-                            folder_name,
-                        )
-                        for link in article_links_all
-                    ]
-                else:
-                    tasks = [
-                        download_image(
-                            session,
-                            url,
-                            progress,
-                            download_sem,
-                            current_failed,
-                            save_path_override=url_to_path[url],
-                            stats=stats,
-                            is_retry=True,
-                        )
-                        for url in failed_images
-                    ]
-
+            # 分批抓文章
+            for i in range(0, len(article_links_all), BATCH_SIZE):
+                batch = article_links_all[i : i + BATCH_SIZE]
+                tasks = [
+                    process_article_page(
+                        link,
+                        browser,
+                        session,
+                        progress,
+                        download_sem,
+                        failed_images,
+                        stats,
+                        existing_titles,
+                    )
+                    for link in batch
+                ]
                 await asyncio.gather(*tasks)
-                spinner_task.cancel()
-                await asyncio.sleep(0.1)
-                failed_images = current_failed
+
+            # retry failed images
+            for attempt in range(MAX_RETRY):
                 if not failed_images:
                     break
+                current_failed = []
+                tasks = [
+                    download_image(
+                        session,
+                        url,
+                        "imgs",
+                        progress,
+                        download_sem,
+                        current_failed,
+                        stats=stats,
+                        is_retry=True,
+                    )
+                    for url in failed_images
+                ]
+                await asyncio.gather(*tasks)
+                failed_images = current_failed
 
             print("\nDownload summary:")
             print("OK_first :", stats["OK_first"])
