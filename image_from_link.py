@@ -41,11 +41,9 @@ async def download_image(
 ):
     async with sem:
         try:
-            if save_path_override:
-                save_path = save_path_override
-            else:
-                filename = url.split("/")[-1].split("?")[0]
-                save_path = os.path.join(save_dir, filename)
+            save_path = save_path_override or os.path.join(
+                save_dir, url.split("/")[-1].split("?")[0]
+            )
 
             if os.path.exists(save_path):
                 progress["done"] += 1
@@ -65,10 +63,7 @@ async def download_image(
                         f"\r[{progress['done']}/{progress['total']}] OK {os.path.basename(save_path)}"
                     )
                     if stats:
-                        if is_retry:
-                            stats["OK_retry"] += 1
-                        else:
-                            stats["OK_first"] += 1
+                        stats["OK_retry" if is_retry else "OK_first"] += 1
                     return True
                 else:
                     progress["done"] += 1
@@ -88,12 +83,11 @@ async def download_image(
 
 async def get_article_links(page, base_url):
     elements = await page.query_selector_all("article a")
-    links = []
-    for a in elements:
-        href = await a.get_attribute("href")
-        if href:
-            links.append(urljoin(base_url, href))
-    return links
+    return [
+        urljoin(base_url, await a.get_attribute("href"))
+        for a in elements
+        if await a.get_attribute("href")
+    ]
 
 
 async def get_image_links(page, base_url):
@@ -118,6 +112,7 @@ async def process_article_page(
     stats,
     existing_titles,
     save_dir,
+    url_to_path,
 ):
     for attempt in range(MAX_PAGE_RETRY + 1):
         page = await browser.new_page()
@@ -187,6 +182,7 @@ async def process_article_page(
                 ext = os.path.splitext(img)[1].split("?")[0] or ".jpg"
                 filename = f"{title}_{idx}{ext}"
                 save_path = os.path.join(save_dir, filename)
+                url_to_path[img] = save_path  # <--- 儲存對應關係
                 tasks.append(
                     download_image(
                         session,
@@ -222,8 +218,8 @@ async def main():
             text = await page.inner_text("body")
             match = re.search(r"Showing\s+\d+\s*-\s*\d+\s+of\s+(\d+)", text)
             total_items = int(match.group(1)) if match else 0
-            # 正確抓作者名，等待出現
 
+            # 抓作者名
             try:
                 await page.wait_for_selector("span[itemprop='name']", timeout=10000)
             except:
@@ -258,7 +254,6 @@ async def main():
                     finally:
                         await page.close()
 
-            # Spinner for fetching pages
             spinner_task = asyncio.create_task(spinner("Fetching pages..."))
             results = await asyncio.gather(*[fetch_article_links(u) for u in page_urls])
             spinner_task.cancel()
@@ -279,10 +274,9 @@ async def main():
             }
             download_sem = asyncio.Semaphore(MAX_DOWNLOAD_CONCURRENCY)
             failed_images = []
-
             existing_titles = set()
+            url_to_path = {}  # <--- 新增對應表
 
-            # Spinner for downloading images
             spinner_task = asyncio.create_task(spinner("Downloading images..."))
             for i in range(0, len(article_links_all), BATCH_SIZE):
                 batch = article_links_all[i : i + BATCH_SIZE]
@@ -297,6 +291,7 @@ async def main():
                         stats,
                         existing_titles,
                         save_dir,
+                        url_to_path,
                     )
                     for link in batch
                 ]
@@ -304,7 +299,7 @@ async def main():
             spinner_task.cancel()
             await asyncio.sleep(0.1)
 
-            # retry failed images
+            # retry failed images，用對應表命名
             for attempt in range(MAX_RETRY):
                 if not failed_images:
                     break
@@ -317,6 +312,7 @@ async def main():
                         progress,
                         download_sem,
                         current_failed,
+                        save_path_override=url_to_path.get(url),
                         stats=stats,
                         is_retry=True,
                     )
