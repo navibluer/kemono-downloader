@@ -7,8 +7,8 @@ import os
 import re
 
 IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
-MAX_PAGE_CONCURRENCY = 1
-MAX_DOWNLOAD_CONCURRENCY = 5
+MAX_PAGE_CONCURRENCY = 3
+MAX_DOWNLOAD_CONCURRENCY = 10
 MAX_RETRY = 2
 MAX_PAGE_RETRY = 2
 BATCH_SIZE = 5
@@ -16,11 +16,6 @@ BATCH_SIZE = 5
 
 def is_image_url(url):
     return url.lower().endswith(IMG_EXTENSIONS)
-
-
-def is_valid_url(url):
-    pattern = r"^https?://(kemono\.fanbox\.cc|commer\.net)/"
-    return re.match(pattern, url) is not None
 
 
 async def spinner(msg="Processing"):
@@ -55,7 +50,7 @@ async def download_image(
             if os.path.exists(save_path):
                 progress["done"] += 1
                 print(
-                    f"\r[{progress['done']}/{progress['total']}] SKIP {os.path.basename(save_path)}",
+                    f"\r[{progress['done']}/{progress['total']}] SKIP {os.path.basename(save_path)}"
                 )
                 if stats:
                     stats["SKIP"] += 1
@@ -67,7 +62,7 @@ async def download_image(
                         await f.write(await resp.read())
                     progress["done"] += 1
                     print(
-                        f"\r[{progress['done']}/{progress['total']}] OK {os.path.basename(save_path)}",
+                        f"\r[{progress['done']}/{progress['total']}] OK {os.path.basename(save_path)}"
                     )
                     if stats:
                         if is_retry:
@@ -77,9 +72,7 @@ async def download_image(
                     return True
                 else:
                     progress["done"] += 1
-                    print(
-                        f"\r[{progress['done']}/{progress['total']}] FAIL {url}",
-                    )
+                    print(f"\r[{progress['done']}/{progress['total']}] FAIL {url}")
                     failed_images.append(url)
                     if is_retry and stats:
                         stats["FAIL_final"] += 1
@@ -124,11 +117,11 @@ async def process_article_page(
     failed_images,
     stats,
     existing_titles,
+    save_dir,
 ):
     for attempt in range(MAX_PAGE_RETRY + 1):
         page = await browser.new_page()
         try:
-            # 禁用圖片、字型、CSS 加速載入
             await page.route(
                 "**/*",
                 lambda route: (
@@ -137,7 +130,6 @@ async def process_article_page(
                     else route.continue_()
                 ),
             )
-
             try:
                 await page.goto(link, wait_until="domcontentloaded", timeout=20000)
             except Exception as e:
@@ -194,12 +186,12 @@ async def process_article_page(
             for idx, img in enumerate(img_urls, start=1):
                 ext = os.path.splitext(img)[1].split("?")[0] or ".jpg"
                 filename = f"{title}_{idx}{ext}"
-                save_path = os.path.join("imgs", filename)
+                save_path = os.path.join(save_dir, filename)
                 tasks.append(
                     download_image(
                         session,
                         img,
-                        "imgs",
+                        save_dir,
                         progress,
                         download_sem,
                         failed_images,
@@ -215,31 +207,37 @@ async def process_article_page(
 
 
 async def main():
-    while True:
-        base_url = input("URL? ")
-        if is_valid_url(base_url):
-            break
-        else:
-            print("Invalid URL. Please enter a Commer or Kemono artist page URL.")
-
+    base_url = input("URL? ")
     os.makedirs("imgs", exist_ok=True)
 
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-
-            spinner_task = asyncio.create_task(spinner("Fetching pages..."))
-
+            browser = await p.chromium.launch(headless=False)
             page = await browser.new_page()
             await page.goto(base_url)
+
             await page.wait_for_load_state("networkidle")
             text = await page.inner_text("body")
             match = re.search(r"Showing\s+\d+\s*-\s*\d+\s+of\s+(\d+)", text)
             total_items = int(match.group(1)) if match else 0
+            # 正確抓作者名，等待出現
+
+            try:
+                await page.wait_for_selector("span[itemprop='name']", timeout=10000)
+            except:
+                pass
+            author_el = await page.query_selector("span[itemprop='name']")
+            author_name = await author_el.inner_text() if author_el else "unknown"
+            author_name = (
+                re.sub(r"[\\/:\*\?\"<>|]", "_", author_name).strip() or "unknown"
+            )
+            save_dir = os.path.join("imgs", author_name)
+            os.makedirs(save_dir, exist_ok=True)
             await page.close()
 
+            print(f"Author: {author_name}")
             print(f"Total articles found: {total_items}")
 
             page_urls = [base_url] + [
@@ -260,12 +258,15 @@ async def main():
                     finally:
                         await page.close()
 
+            # Spinner for fetching pages
+            spinner_task = asyncio.create_task(spinner("Fetching pages..."))
             results = await asyncio.gather(*[fetch_article_links(u) for u in page_urls])
+            spinner_task.cancel()
+            await asyncio.sleep(0.1)
+
             for r in results:
                 article_links_all.extend(r)
 
-            spinner_task.cancel()
-            await asyncio.sleep(0.1)
             print(f"Total article links collected: {len(article_links_all)}")
 
             progress = {"done": 0, "total": 0}
@@ -280,6 +281,9 @@ async def main():
             failed_images = []
 
             existing_titles = set()
+
+            # Spinner for downloading images
+            spinner_task = asyncio.create_task(spinner("Downloading images..."))
             for i in range(0, len(article_links_all), BATCH_SIZE):
                 batch = article_links_all[i : i + BATCH_SIZE]
                 tasks = [
@@ -292,10 +296,13 @@ async def main():
                         failed_images,
                         stats,
                         existing_titles,
+                        save_dir,
                     )
                     for link in batch
                 ]
                 await asyncio.gather(*tasks)
+            spinner_task.cancel()
+            await asyncio.sleep(0.1)
 
             # retry failed images
             for attempt in range(MAX_RETRY):
@@ -306,7 +313,7 @@ async def main():
                     download_image(
                         session,
                         url,
-                        "imgs",
+                        save_dir,
                         progress,
                         download_sem,
                         current_failed,
