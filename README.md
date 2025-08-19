@@ -26,6 +26,7 @@ Install dependencies:
 
 ```bash
 pip install playwright aiohttp aiofiles
+```
 
 ## Usage
 
