@@ -214,7 +214,7 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
+            browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             await page.goto(base_url)
 
