@@ -56,7 +56,6 @@ async def download_image(
                 progress["done"] += 1
                 print(
                     f"\r[{progress['done']}/{progress['total']}] SKIP {os.path.basename(save_path)}",
-                    end="",
                 )
                 if stats:
                     stats["SKIP"] += 1
@@ -69,7 +68,6 @@ async def download_image(
                     progress["done"] += 1
                     print(
                         f"\r[{progress['done']}/{progress['total']}] OK {os.path.basename(save_path)}",
-                        end="",
                     )
                     if stats:
                         if is_retry:
@@ -80,7 +78,7 @@ async def download_image(
                 else:
                     progress["done"] += 1
                     print(
-                        f"\r[{progress['done']}/{progress['total']}] FAIL {url}", end=""
+                        f"\r[{progress['done']}/{progress['total']}] FAIL {url}",
                     )
                     failed_images.append(url)
                     if is_retry and stats:
@@ -88,7 +86,7 @@ async def download_image(
                     return False
         except Exception as e:
             progress["done"] += 1
-            print(f"\r[{progress['done']}/{progress['total']}] ERR {url} {e}", end="")
+            print(f"\r[{progress['done']}/{progress['total']}] ERR {url} {e}")
             failed_images.append(url)
             if is_retry and stats:
                 stats["ERR_final"] += 1

@@ -33,6 +33,7 @@ Run the script and input the artist’s first page URL:
 
 ```bash
 python image_from_link.py
+```
 
 - The URL must point to the first page of the artist’s content.
 - The script will create a folder imgs/<user> based on the span[itemprop="name"] in the page.
