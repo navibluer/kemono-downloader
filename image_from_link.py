@@ -6,18 +6,21 @@ import aiofiles
 import os
 import re
 
-# ---------------- 配置 ----------------
 IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
-MAX_PAGE_CONCURRENCY = 3  # 同時打開文章頁面數量
-MAX_DOWNLOAD_CONCURRENCY = 10  # 同時下載圖片數量
-MAX_RETRY = 2  # 失敗圖片重試次數
-MAX_PAGE_RETRY = 2  # 打開文章頁面重試次數
-BATCH_SIZE = 5  # 分批處理文章數量
+MAX_PAGE_CONCURRENCY = 1
+MAX_DOWNLOAD_CONCURRENCY = 5
+MAX_RETRY = 2
+MAX_PAGE_RETRY = 2
+BATCH_SIZE = 5
 
 
-# ---------------- 工具函數 ----------------
 def is_image_url(url):
     return url.lower().endswith(IMG_EXTENSIONS)
+
+
+def is_valid_url(url):
+    pattern = r"^https?://(kemono\.fanbox\.cc|commer\.net)/"
+    return re.match(pattern, url) is not None
 
 
 async def spinner(msg="Processing"):
@@ -43,9 +46,11 @@ async def download_image(
 ):
     async with sem:
         try:
-            save_path = save_path_override or os.path.join(
-                save_dir, url.split("/")[-1].split("?")[0]
-            )
+            if save_path_override:
+                save_path = save_path_override
+            else:
+                filename = url.split("/")[-1].split("?")[0]
+                save_path = os.path.join(save_dir, filename)
 
             if os.path.exists(save_path):
                 progress["done"] += 1
@@ -67,7 +72,10 @@ async def download_image(
                         end="",
                     )
                     if stats:
-                        stats["OK_retry" if is_retry else "OK_first"] += 1
+                        if is_retry:
+                            stats["OK_retry"] += 1
+                        else:
+                            stats["OK_first"] += 1
                     return True
                 else:
                     progress["done"] += 1
@@ -89,11 +97,12 @@ async def download_image(
 
 async def get_article_links(page, base_url):
     elements = await page.query_selector_all("article a")
-    return [
-        urljoin(base_url, await a.get_attribute("href"))
-        for a in elements
-        if await a.get_attribute("href")
-    ]
+    links = []
+    for a in elements:
+        href = await a.get_attribute("href")
+        if href:
+            links.append(urljoin(base_url, href))
+    return links
 
 
 async def get_image_links(page, base_url):
@@ -108,7 +117,6 @@ async def get_image_links(page, base_url):
     return img_urls
 
 
-# ---------------- 處理文章頁 ----------------
 async def process_article_page(
     link,
     browser,
@@ -122,7 +130,7 @@ async def process_article_page(
     for attempt in range(MAX_PAGE_RETRY + 1):
         page = await browser.new_page()
         try:
-            # 禁用非必要資源
+            # 禁用圖片、字型、CSS 加速載入
             await page.route(
                 "**/*",
                 lambda route: (
@@ -134,12 +142,12 @@ async def process_article_page(
 
             try:
                 await page.goto(link, wait_until="domcontentloaded", timeout=20000)
-            except Exception:
+            except Exception as e:
                 if attempt < MAX_PAGE_RETRY:
                     await asyncio.sleep(2)
                     continue
                 else:
-                    print(f"\nFailed to open {link} after retries")
+                    print(f"\nFailed to open {link} after retries: {e}")
                     return
 
             try:
@@ -150,19 +158,19 @@ async def process_article_page(
                 pass
 
             title_element = await page.query_selector("h1.post__title")
-            title = "untitled"
             if title_element:
-                title = re.sub(
-                    r"[\\/:\*\?\"<>|]", "_", (await title_element.inner_text()).strip()
-                )
-                if not title:
+                title = await title_element.inner_text()
+                title = re.sub(r"[\\/:\*\?\"<>|]", "_", title)
+                if not title.strip():
                     title = "untitled"
+            else:
+                title = "untitled"
 
             if title.startswith("untitled"):
                 uid = re.search(r"/post/(\d+)", link)
-                title = f"{title}_{uid.group(1) if uid else str(hash(link))}"
+                uid = uid.group(1) if uid else str(hash(link))
+                title = f"{title}_{uid}"
 
-            # 避免標題重複
             base_title = title
             suffix = 1
             while title in existing_titles:
@@ -176,37 +184,46 @@ async def process_article_page(
                     await asyncio.sleep(1)
                     continue
                 else:
-                    print(f"\nNo figure found on {link}")
+                    print(
+                        f"\nNo figure found on {link} after {MAX_PAGE_RETRY+1} attempts"
+                    )
                     return
 
             img_urls = await get_image_links(page, link)
             progress["total"] += len(img_urls)
 
-            tasks = [
-                download_image(
-                    session,
-                    img,
-                    "imgs",
-                    progress,
-                    download_sem,
-                    failed_images,
-                    save_path_override=os.path.join(
+            tasks = []
+            for idx, img in enumerate(img_urls, start=1):
+                ext = os.path.splitext(img)[1].split("?")[0] or ".jpg"
+                filename = f"{title}_{idx}{ext}"
+                save_path = os.path.join("imgs", filename)
+                tasks.append(
+                    download_image(
+                        session,
+                        img,
                         "imgs",
-                        f"{title}_{idx}{os.path.splitext(img)[1].split('?')[0] or '.jpg'}",
-                    ),
-                    stats=stats,
+                        progress,
+                        download_sem,
+                        failed_images,
+                        save_path_override=save_path,
+                        stats=stats,
+                    )
                 )
-                for idx, img in enumerate(img_urls, start=1)
-            ]
+
             await asyncio.gather(*tasks)
             break
         finally:
             await page.close()
 
 
-# ---------------- Main ----------------
 async def main():
-    base_url = input("URL? ")
+    while True:
+        base_url = input("URL? ")
+        if is_valid_url(base_url):
+            break
+        else:
+            print("Invalid URL. Please enter a Commer or Kemono artist page URL.")
+
     os.makedirs("imgs", exist_ok=True)
 
     connector = aiohttp.TCPConnector(ssl=False)
@@ -263,9 +280,8 @@ async def main():
             }
             download_sem = asyncio.Semaphore(MAX_DOWNLOAD_CONCURRENCY)
             failed_images = []
-            existing_titles = set()
 
-            # 分批抓文章
+            existing_titles = set()
             for i in range(0, len(article_links_all), BATCH_SIZE):
                 batch = article_links_all[i : i + BATCH_SIZE]
                 tasks = [
