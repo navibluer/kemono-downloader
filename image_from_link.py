@@ -45,6 +45,7 @@ async def download_image(
                 save_dir, url.split("/")[-1].split("?")[0]
             )
 
+            # 已存在檔案不重抓
             if os.path.exists(save_path):
                 progress["done"] += 1
                 print(
@@ -58,6 +59,11 @@ async def download_image(
                 if resp.status == 200:
                     async with aiofiles.open(save_path, "wb") as f:
                         await f.write(await resp.read())
+
+                    # ➕ 檢查是否 0 byte
+                    if os.path.getsize(save_path) == 0:
+                        raise Exception("Empty file")
+
                     progress["done"] += 1
                     print(
                         f"\r[{progress['done']}/{progress['total']}] OK {os.path.basename(save_path)}"
@@ -66,12 +72,8 @@ async def download_image(
                         stats["OK_retry" if is_retry else "OK_first"] += 1
                     return True
                 else:
-                    progress["done"] += 1
-                    print(f"\r[{progress['done']}/{progress['total']}] FAIL {url}")
-                    failed_images.append(url)
-                    if is_retry and stats:
-                        stats["FAIL_final"] += 1
-                    return False
+                    raise Exception(f"http status {resp.status}")
+
         except Exception as e:
             progress["done"] += 1
             print(f"\r[{progress['done']}/{progress['total']}] ERR {url} {e}")
@@ -135,21 +137,25 @@ async def process_article_page(
                     print(f"\nFailed to open {link} after retries: {e}")
                     return
 
+            # 文章標題
             try:
-                await page.wait_for_selector(
-                    "h1.post__title", state="attached", timeout=10000
-                )
+                await page.wait_for_selector("h1.post__title", timeout=10000)
             except:
                 pass
 
             title_element = await page.query_selector("h1.post__title")
-            if title_element:
-                title = await title_element.inner_text()
-                title = re.sub(r"[\\/:\*\?\"<>|]", "_", title)
-                if not title.strip():
-                    title = "untitled"
-            else:
-                title = "untitled"
+            title = (
+                await title_element.inner_text() if title_element else "untitled"
+            ).strip()
+            title = re.sub(r"[\\/:\*\?\"<>|]", "_", title) or "untitled"
+
+            # 抓日期
+            date_text = "00000000"
+            time_el = await page.query_selector("time.timestamp")
+            if time_el:
+                raw = (await time_el.inner_text()).strip()
+                # 只取數字  2023-12-31 → 20231231
+                date_text = "".join(re.findall(r"\d", raw))[:8] or "00000000"
 
             if title.startswith("untitled"):
                 uid = re.search(r"/post/(\d+)", link)
@@ -169,9 +175,7 @@ async def process_article_page(
                     await asyncio.sleep(1)
                     continue
                 else:
-                    print(
-                        f"\nNo figure found on {link} after {MAX_PAGE_RETRY+1} attempts"
-                    )
+                    print(f"\nNo figure found on {link}")
                     return
 
             img_urls = await get_image_links(page, link)
@@ -180,9 +184,9 @@ async def process_article_page(
             tasks = []
             for idx, img in enumerate(img_urls, start=1):
                 ext = os.path.splitext(img)[1].split("?")[0] or ".jpg"
-                filename = f"{title}_{idx}{ext}"
+                filename = f"{date_text}_{title}_{idx}{ext}"
                 save_path = os.path.join(save_dir, filename)
-                url_to_path[img] = save_path  # <--- 儲存對應關係
+                url_to_path[img] = save_path
                 tasks.append(
                     download_image(
                         session,
@@ -195,7 +199,6 @@ async def process_article_page(
                         stats=stats,
                     )
                 )
-
             await asyncio.gather(*tasks)
             break
         finally:
