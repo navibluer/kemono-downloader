@@ -193,7 +193,7 @@ async def process_article_page(
                     print(f"\nNo figure found on {link}")
                     return
 
-            img_urls = await get_image_links(page, link)
+            img_urls = sorted(await get_image_links(page, link))
             progress["total"] += len(img_urls)
 
             tasks = []
