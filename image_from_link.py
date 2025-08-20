@@ -5,6 +5,8 @@ import aiohttp
 import aiofiles
 import os
 import re
+import time
+from datetime import datetime
 
 IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 MAX_PAGE_CONCURRENCY = 3
@@ -28,6 +30,14 @@ async def spinner(msg="Processing"):
         print("\r" + " " * (len(msg) + 2) + "\r", end="", flush=True)
 
 
+def date_text_to_timestamp(date_text):
+    try:
+        dt = datetime.strptime(date_text, "%Y%m%d")
+        return int(dt.timestamp())
+    except:
+        return int(time.time())
+
+
 async def download_image(
     session,
     url,
@@ -38,6 +48,7 @@ async def download_image(
     save_path_override=None,
     stats=None,
     is_retry=False,
+    mtime=None,  # 新增修改時間參數
 ):
     async with sem:
         try:
@@ -60,9 +71,13 @@ async def download_image(
                     async with aiofiles.open(save_path, "wb") as f:
                         await f.write(await resp.read())
 
-                    # ➕ 檢查是否 0 byte
+                    # 檢查是否 0 byte
                     if os.path.getsize(save_path) == 0:
                         raise Exception("Empty file")
+
+                    # 設定檔案修改時間
+                    if mtime:
+                        os.utime(save_path, (mtime, mtime))
 
                     progress["done"] += 1
                     print(
@@ -149,13 +164,13 @@ async def process_article_page(
             ).strip()
             title = re.sub(r"[\\/:\*\?\"<>|]", "_", title) or "untitled"
 
-            # 抓日期
+            # 取得文章發布日期
             date_text = "00000000"
             time_el = await page.query_selector("time.timestamp")
             if time_el:
                 raw = (await time_el.inner_text()).strip()
-                # 只取數字  2023-12-31 → 20231231
                 date_text = "".join(re.findall(r"\d", raw))[:8] or "00000000"
+            timestamp = date_text_to_timestamp(date_text)
 
             if title.startswith("untitled"):
                 uid = re.search(r"/post/(\d+)", link)
@@ -184,7 +199,7 @@ async def process_article_page(
             tasks = []
             for idx, img in enumerate(img_urls, start=1):
                 ext = os.path.splitext(img)[1].split("?")[0] or ".jpg"
-                filename = f"{date_text}_{title}_{idx}{ext}"
+                filename = f"{title}_{idx}{ext}"
                 save_path = os.path.join(save_dir, filename)
                 url_to_path[img] = save_path
                 tasks.append(
@@ -197,6 +212,7 @@ async def process_article_page(
                         failed_images,
                         save_path_override=save_path,
                         stats=stats,
+                        mtime=timestamp,  # 設定修改時間
                     )
                 )
             await asyncio.gather(*tasks)
@@ -216,8 +232,8 @@ async def main():
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             await page.goto(base_url)
-
             await page.wait_for_load_state("networkidle")
+
             text = await page.inner_text("body")
             match = re.search(r"Showing\s+\d+\s*-\s*\d+\s+of\s+(\d+)", text)
             total_items = int(match.group(1)) if match else 0
@@ -278,7 +294,7 @@ async def main():
             download_sem = asyncio.Semaphore(MAX_DOWNLOAD_CONCURRENCY)
             failed_images = []
             existing_titles = set()
-            url_to_path = {}  # <--- 新增對應表
+            url_to_path = {}
 
             spinner_task = asyncio.create_task(spinner("Downloading images..."))
             for i in range(0, len(article_links_all), BATCH_SIZE):
@@ -302,7 +318,7 @@ async def main():
             spinner_task.cancel()
             await asyncio.sleep(0.1)
 
-            # retry failed images，用對應表命名
+            # retry failed images
             for attempt in range(MAX_RETRY):
                 if not failed_images:
                     break
