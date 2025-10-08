@@ -14,6 +14,7 @@ MAX_DOWNLOAD_CONCURRENCY = 10
 MAX_RETRY = 2
 MAX_PAGE_RETRY = 2
 BATCH_SIZE = 5
+CHUNK_SIZE = 8192  # Stream download chunk size
 
 
 def is_image_url(url):
@@ -34,7 +35,7 @@ def date_text_to_timestamp(date_text):
     try:
         dt = datetime.strptime(date_text, "%Y%m%d")
         return int(dt.timestamp())
-    except:
+    except (ValueError, TypeError):
         return int(time.time())
 
 
@@ -69,27 +70,31 @@ async def download_image(
             async with session.get(url) as resp:
                 if resp.status == 200:
                     async with aiofiles.open(save_path, "wb") as f:
-                        await f.write(await resp.read())
+                        # Stream download in chunks to reduce memory usage
+                        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                            await f.write(chunk)
 
                     # 檢查是否 0 byte
-                    if os.path.getsize(save_path) == 0:
-                        raise Exception("Empty file")
+                    file_size = os.path.getsize(save_path)
+                    if file_size == 0:
+                        raise ValueError("Empty file")
 
                     # 設定檔案修改時間
                     if mtime:
                         os.utime(save_path, (mtime, mtime))
 
                     progress["done"] += 1
+                    basename = os.path.basename(save_path)
                     print(
-                        f"\r[{progress['done']}/{progress['total']}] OK {os.path.basename(save_path)}"
+                        f"\r[{progress['done']}/{progress['total']}] OK {basename}"
                     )
                     if stats:
                         stats["OK_retry" if is_retry else "OK_first"] += 1
                     return True
                 else:
-                    raise Exception(f"http status {resp.status}")
+                    raise ValueError(f"HTTP status {resp.status}")
 
-        except Exception as e:
+        except (aiohttp.ClientError, ValueError, OSError) as e:
             progress["done"] += 1
             print(f"\r[{progress['done']}/{progress['total']}] ERR {url} {e}")
             failed_images.append(url)
@@ -116,7 +121,7 @@ async def get_image_links(page, base_url):
             full_url = urljoin(base_url, href)
             if is_image_url(full_url):
                 img_urls.append(full_url)
-    return img_urls
+    return list(dict.fromkeys(img_urls))  # Remove duplicates while preserving order
 
 
 async def process_article_page(
@@ -155,7 +160,7 @@ async def process_article_page(
             # 文章標題
             try:
                 await page.wait_for_selector("h1.post__title", timeout=10000)
-            except:
+            except Exception:
                 pass
 
             title_element = await page.query_selector("h1.post__title")
@@ -193,7 +198,7 @@ async def process_article_page(
                     print(f"\nNo figure found on {link}")
                     return
 
-            img_urls = sorted(await get_image_links(page, link))
+            img_urls = await get_image_links(page, link)  # Already deduplicated
             progress["total"] += len(img_urls)
 
             tasks = []
@@ -225,7 +230,7 @@ async def main():
     base_url = input("URL? ")
     os.makedirs("imgs", exist_ok=True)
 
-    connector = aiohttp.TCPConnector(ssl=False)
+    connector = aiohttp.TCPConnector(ssl=False, limit=100, limit_per_host=30)
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async with async_playwright() as p:
@@ -241,7 +246,7 @@ async def main():
             # 抓作者名
             try:
                 await page.wait_for_selector("span[itemprop='name']", timeout=10000)
-            except:
+            except Exception:
                 pass
             author_el = await page.query_selector("span[itemprop='name']")
             author_name = await author_el.inner_text() if author_el else "unknown"
@@ -323,6 +328,14 @@ async def main():
                 if not failed_images:
                     break
                 current_failed = []
+
+                # Extract mtime from file path if it exists
+                def get_mtime_from_path(url):
+                    path = url_to_path.get(url)
+                    if path and os.path.exists(path):
+                        return int(os.path.getmtime(path))
+                    return None
+
                 tasks = [
                     download_image(
                         session,
@@ -334,6 +347,7 @@ async def main():
                         save_path_override=url_to_path.get(url),
                         stats=stats,
                         is_retry=True,
+                        mtime=get_mtime_from_path(url),
                     )
                     for url in failed_images
                 ]
