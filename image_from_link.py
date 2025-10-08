@@ -254,7 +254,7 @@ async def process_article_page(
 
 
 async def main():
-    base_url = input("URL? ")
+    base_url = input("URL? ").split('?')[0]
 
     # Get filter month from user (format: YY MM)
     month_input = input("Filter month (format: YY MM, default '25 01' for 2025/01, 'n' to disable): ").strip()
