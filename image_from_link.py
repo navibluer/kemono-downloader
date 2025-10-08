@@ -256,8 +256,8 @@ async def process_article_page(
 async def main():
     base_url = input("URL? ").split('?')[0]
 
-    # Get filter month from user (format: YY MM)
-    month_input = input("Filter month (format: YY MM, default '25 01' for 2025/01, 'n' to disable): ").strip()
+    # Get filter month from user (format: YYMM)
+    month_input = input("Filter month (format: YYMM, default '2501' for 2025/01, 'n' to disable): ").strip()
     if month_input.lower() == 'n':
         filter_month = None
         print("Month filter disabled")
@@ -266,11 +266,10 @@ async def main():
         print(f"Filtering articles from 2025/01 onwards")
     else:
         try:
-            parts = month_input.split()
-            if len(parts) != 2:
+            if len(month_input) != 4:
                 raise ValueError("Invalid format")
-            year_2digit = int(parts[0])
-            month = int(parts[1])
+            year_2digit = int(month_input[:2])
+            month = int(month_input[2:])
             if month < 1 or month > 12:
                 raise ValueError("Invalid month")
             filter_month = (2000 + year_2digit, month)
