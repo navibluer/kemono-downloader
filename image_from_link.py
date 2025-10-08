@@ -95,7 +95,7 @@ async def download_image(
                 else:
                     raise ValueError(f"HTTP status {resp.status}")
 
-        except (aiohttp.ClientError, ValueError, OSError) as e:
+        except (aiohttp.ClientError, ValueError, OSError, asyncio.TimeoutError) as e:
             progress["done"] += 1
             print(f"\r[{progress['done']}/{progress['total']}] ERR {url} {e}")
             failed_images.append(url)
@@ -104,15 +104,16 @@ async def download_image(
             return False
 
 
-async def get_article_links(page, base_url, filter_year=None):
-    """Get article links, optionally filtered by filter_year"""
+async def get_article_links(page, base_url, filter_month=None):
+    """Get article links, optionally filtered by filter_month (year, month)"""
     articles = await page.query_selector_all("article")
     links = []
 
-    # Calculate filter timestamp if filter_year is set
+    # Calculate filter timestamp if filter_month is set
     filter_timestamp = None
-    if filter_year:
-        filter_timestamp = int(datetime(filter_year, 1, 1).timestamp())
+    if filter_month:
+        year, month = filter_month
+        filter_timestamp = int(datetime(year, month, 1).timestamp())
 
     for article in articles:
         # Get the link
@@ -131,7 +132,7 @@ async def get_article_links(page, base_url, filter_year=None):
                 if datetime_str:
                     article_timestamp = parse_datetime_attr(datetime_str)
                     if article_timestamp < filter_timestamp:
-                        continue  # Skip articles before the filter year
+                        continue  # Skip articles before the filter month
 
         links.append(urljoin(base_url, href))
 
@@ -255,21 +256,28 @@ async def process_article_page(
 async def main():
     base_url = input("URL? ")
 
-    # Get filter year from user
-    year_input = input("Filter year (default 2025, press Enter to use default, 'n' to disable): ").strip()
-    if year_input.lower() == 'n':
-        filter_year = None
-        print("Year filter disabled")
-    elif year_input == '':
-        filter_year = 2025
-        print(f"Filtering articles from {filter_year}/1/1 onwards")
+    # Get filter month from user (format: YY MM)
+    month_input = input("Filter month (format: YY MM, default '25 01' for 2025/01, 'n' to disable): ").strip()
+    if month_input.lower() == 'n':
+        filter_month = None
+        print("Month filter disabled")
+    elif month_input == '':
+        filter_month = (2025, 1)
+        print(f"Filtering articles from 2025/01 onwards")
     else:
         try:
-            filter_year = int(year_input)
-            print(f"Filtering articles from {filter_year}/1/1 onwards")
+            parts = month_input.split()
+            if len(parts) != 2:
+                raise ValueError("Invalid format")
+            year_2digit = int(parts[0])
+            month = int(parts[1])
+            if month < 1 or month > 12:
+                raise ValueError("Invalid month")
+            filter_month = (2000 + year_2digit, month)
+            print(f"Filtering articles from {filter_month[0]}/{filter_month[1]:02d} onwards")
         except ValueError:
-            print("Invalid year, using default 2025")
-            filter_year = 2025
+            print("Invalid input, using default 2025/01")
+            filter_month = (2025, 1)
 
     os.makedirs("imgs", exist_ok=True)
 
@@ -317,7 +325,7 @@ async def main():
                     try:
                         await page.goto(page_url)
                         await page.wait_for_selector("article", timeout=10000)
-                        return await get_article_links(page, page_url, filter_year)
+                        return await get_article_links(page, page_url, filter_month)
                     finally:
                         await page.close()
 
