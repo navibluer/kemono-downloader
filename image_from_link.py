@@ -31,11 +31,12 @@ async def spinner(msg="Processing"):
         print("\r" + " " * (len(msg) + 2) + "\r", end="", flush=True)
 
 
-def date_text_to_timestamp(date_text):
+def parse_datetime_attr(datetime_str):
+    """Parse datetime attribute like '2021-05-22T04:53:38' to timestamp"""
     try:
-        dt = datetime.strptime(date_text, "%Y%m%d")
+        dt = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
         return int(dt.timestamp())
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return int(time.time())
 
 
@@ -103,13 +104,38 @@ async def download_image(
             return False
 
 
-async def get_article_links(page, base_url):
-    elements = await page.query_selector_all("article a")
-    return [
-        urljoin(base_url, await a.get_attribute("href"))
-        for a in elements
-        if await a.get_attribute("href")
-    ]
+async def get_article_links(page, base_url, filter_year=None):
+    """Get article links, optionally filtered by filter_year"""
+    articles = await page.query_selector_all("article")
+    links = []
+
+    # Calculate filter timestamp if filter_year is set
+    filter_timestamp = None
+    if filter_year:
+        filter_timestamp = int(datetime(filter_year, 1, 1).timestamp())
+
+    for article in articles:
+        # Get the link
+        a_element = await article.query_selector("a")
+        if not a_element:
+            continue
+        href = await a_element.get_attribute("href")
+        if not href:
+            continue
+
+        # Check datetime if filtering is enabled
+        if filter_timestamp:
+            time_element = await article.query_selector("time")
+            if time_element:
+                datetime_str = await time_element.get_attribute("datetime")
+                if datetime_str:
+                    article_timestamp = parse_datetime_attr(datetime_str)
+                    if article_timestamp < filter_timestamp:
+                        continue  # Skip articles before the filter year
+
+        links.append(urljoin(base_url, href))
+
+    return links
 
 
 async def get_image_links(page, base_url):
@@ -169,13 +195,13 @@ async def process_article_page(
             ).strip()
             title = re.sub(r"[\\/:\*\?\"<>|]", "_", title) or "untitled"
 
-            # 取得文章發布日期
-            date_text = "00000000"
-            time_el = await page.query_selector("time.timestamp")
+            # 取得文章發布日期 (使用 datetime 屬性)
+            timestamp = int(time.time())  # Default to current time
+            time_el = await page.query_selector("time")
             if time_el:
-                raw = (await time_el.inner_text()).strip()
-                date_text = "".join(re.findall(r"\d", raw))[:8] or "00000000"
-            timestamp = date_text_to_timestamp(date_text)
+                datetime_str = await time_el.get_attribute("datetime")
+                if datetime_str:
+                    timestamp = parse_datetime_attr(datetime_str)
 
             if title.startswith("untitled"):
                 uid = re.search(r"/post/(\d+)", link)
@@ -228,6 +254,23 @@ async def process_article_page(
 
 async def main():
     base_url = input("URL? ")
+
+    # Get filter year from user
+    year_input = input("Filter year (default 2025, press Enter to use default, 'n' to disable): ").strip()
+    if year_input.lower() == 'n':
+        filter_year = None
+        print("Year filter disabled")
+    elif year_input == '':
+        filter_year = 2025
+        print(f"Filtering articles from {filter_year}/1/1 onwards")
+    else:
+        try:
+            filter_year = int(year_input)
+            print(f"Filtering articles from {filter_year}/1/1 onwards")
+        except ValueError:
+            print("Invalid year, using default 2025")
+            filter_year = 2025
+
     os.makedirs("imgs", exist_ok=True)
 
     connector = aiohttp.TCPConnector(ssl=False, limit=100, limit_per_host=30)
@@ -274,7 +317,7 @@ async def main():
                     try:
                         await page.goto(page_url)
                         await page.wait_for_selector("article", timeout=10000)
-                        return await get_article_links(page, page_url)
+                        return await get_article_links(page, page_url, filter_year)
                     finally:
                         await page.close()
 
